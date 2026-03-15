@@ -1,0 +1,528 @@
+# eximIA Gate — Complete Integration Guide for AI Agents
+# Contract: eximia-gate/v1
+# Purpose: This file contains EVERYTHING needed to integrate any Next.js app with eximIA Gate.
+# An AI agent reading this file should be able to implement the full integration autonomously.
+
+================================================================================
+OVERVIEW
+================================================================================
+
+eximIA Gate is the centralized auth & identity service for the eximIA ecosystem.
+Each app keeps its own login UI but calls Gate's API behind the scenes.
+Users get one identity across all apps. Admins control which apps each user can access.
+
+GATE_URL: https://gate.eximiaventures.com.br (production)
+GATE_URL: http://localhost:3011 (development)
+
+================================================================================
+INTEGRATION CHECKLIST (4 steps)
+================================================================================
+
+1. Add GATE_URL to .env.local
+2. Create lib/gate.ts (auth utilities)
+3. Add login/register UI (or adapt existing)
+4. Protect API routes and pages with Gate auth
+
+================================================================================
+STEP 1: Environment Variable
+================================================================================
+
+Add to your .env.local:
+
+```
+GATE_URL=http://localhost:3011
+```
+
+Add to your .env.local.example:
+
+```
+GATE_URL=https://gate.eximiaventures.com.br
+```
+
+================================================================================
+STEP 2: Create lib/gate.ts
+================================================================================
+
+Create this file in your app. It handles ALL communication with Gate.
+Copy exactly as-is — no modifications needed except APP_SLUG.
+
+```typescript
+// lib/gate.ts
+// eximIA Gate integration — generated from contract v1
+// Change APP_SLUG to your app's slug registered in Gate
+
+const GATE_URL = process.env.GATE_URL || process.env.NEXT_PUBLIC_GATE_URL || "http://localhost:3011";
+const APP_SLUG = "YOUR_APP_SLUG"; // CHANGE THIS: academy, forms, profiler, maps, etc.
+
+// ─── Types ───
+
+export interface GateUser {
+  id: string;
+  email: string;
+  name: string;
+  role: "user" | "admin";
+  avatar_url: string | null;
+  apps: string[];
+  created_at: string;
+}
+
+export interface AuthResponse {
+  token: string;
+  refresh_token: string;
+  user: GateUser;
+}
+
+export interface VerifyResponse {
+  user: GateUser;
+  scopes: string[];
+  apps_allowed: string[];
+}
+
+// ─── Client-side: Auth actions (call from UI) ───
+
+export async function gateLogin(email: string, password: string): Promise<AuthResponse> {
+  const res = await fetch(`${GATE_URL}/api/v1/gate/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Login failed");
+  return data;
+}
+
+export async function gateRegister(name: string, email: string, password: string): Promise<AuthResponse> {
+  const res = await fetch(`${GATE_URL}/api/v1/gate/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, email, password }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Registration failed");
+  return data;
+}
+
+export async function gateRefresh(refresh_token: string): Promise<{ token: string; refresh_token: string }> {
+  const res = await fetch(`${GATE_URL}/api/v1/gate/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Refresh failed");
+  return data;
+}
+
+// ─── Client-side: Token management (localStorage) ───
+
+export function saveAuth(data: AuthResponse): void {
+  localStorage.setItem("gate_token", data.token);
+  localStorage.setItem("gate_refresh", data.refresh_token);
+  localStorage.setItem("gate_user", JSON.stringify(data.user));
+}
+
+export function getToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("gate_token");
+}
+
+export function getUser(): GateUser | null {
+  if (typeof window === "undefined") return null;
+  const raw = localStorage.getItem("gate_user");
+  return raw ? JSON.parse(raw) : null;
+}
+
+export function isAuthenticated(): boolean {
+  return !!getToken();
+}
+
+export function logout(): void {
+  localStorage.removeItem("gate_token");
+  localStorage.removeItem("gate_refresh");
+  localStorage.removeItem("gate_user");
+}
+
+// ─── Client-side: Auto-refresh on token expiry ───
+
+export async function getValidToken(): Promise<string | null> {
+  const token = getToken();
+  if (!token) return null;
+
+  // Decode JWT to check expiry (no verification needed client-side)
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    const expiresIn = payload.exp * 1000 - Date.now();
+
+    // If token expires in less than 5 minutes, refresh
+    if (expiresIn < 5 * 60 * 1000) {
+      const refresh = localStorage.getItem("gate_refresh");
+      if (!refresh) return null;
+
+      try {
+        const data = await gateRefresh(refresh);
+        localStorage.setItem("gate_token", data.token);
+        localStorage.setItem("gate_refresh", data.refresh_token);
+        return data.token;
+      } catch {
+        logout();
+        return null;
+      }
+    }
+
+    return token;
+  } catch {
+    return token; // If decode fails, return as-is and let server validate
+  }
+}
+
+// ─── Server-side: Protect API routes ───
+
+export async function withGateAuth(req: Request): Promise<
+  { user: VerifyResponse["user"]; scopes: string[]; error?: never } |
+  { user?: never; scopes?: never; error: Response }
+> {
+  const authHeader = req.headers.get("authorization");
+  if (!authHeader?.startsWith("Bearer ")) {
+    return {
+      error: Response.json(
+        { error: "Missing authorization header", code: "UNAUTHORIZED" },
+        { status: 401 }
+      ),
+    };
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    const res = await fetch(`${GATE_URL}/api/v1/gate/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!res.ok) {
+      return {
+        error: Response.json(
+          { error: "Invalid or expired token", code: "INVALID_TOKEN" },
+          { status: 401 }
+        ),
+      };
+    }
+
+    const data: VerifyResponse = await res.json();
+
+    // Check if user has access to THIS app
+    if (!data.apps_allowed.includes(APP_SLUG)) {
+      return {
+        error: Response.json(
+          { error: "You do not have access to this app", code: "APP_ACCESS_DENIED" },
+          { status: 403 }
+        ),
+      };
+    }
+
+    return { user: data.user, scopes: data.scopes };
+  } catch {
+    return {
+      error: Response.json(
+        { error: "Gate service unavailable", code: "GATE_UNAVAILABLE" },
+        { status: 503 }
+      ),
+    };
+  }
+}
+
+// ─── Server-side: Require admin role ───
+
+export async function withGateAdmin(req: Request): Promise<
+  { user: VerifyResponse["user"]; error?: never } |
+  { user?: never; error: Response }
+> {
+  const auth = await withGateAuth(req);
+  if (auth.error) return auth;
+
+  if (auth.user.role !== "admin") {
+    return {
+      error: Response.json(
+        { error: "Admin access required", code: "FORBIDDEN" },
+        { status: 403 }
+      ),
+    };
+  }
+
+  return { user: auth.user };
+}
+```
+
+================================================================================
+STEP 3: Login & Register UI
+================================================================================
+
+Option A: Minimal login page (replace your existing /login page)
+
+```tsx
+// app/login/page.tsx
+"use client";
+
+import { useState, FormEvent } from "react";
+import { useRouter } from "next/navigation";
+import { gateLogin, saveAuth } from "@/lib/gate";
+
+export default function LoginPage() {
+  const router = useRouter();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+    try {
+      const data = await gateLogin(email, password);
+      saveAuth(data);
+      router.push("/dashboard"); // or wherever your app redirects after login
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email" required />
+      <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Senha" required />
+      {error && <p style={{ color: "red" }}>{error}</p>}
+      <button type="submit" disabled={loading}>{loading ? "Entrando..." : "Entrar"}</button>
+    </form>
+  );
+}
+```
+
+Option B: If your app already has a login form, just replace the submit handler:
+
+```typescript
+// Before (local auth):
+const res = await fetch("/api/auth/login", { ... });
+
+// After (Gate auth):
+import { gateLogin, saveAuth } from "@/lib/gate";
+const data = await gateLogin(email, password);
+saveAuth(data);
+router.push("/dashboard");
+```
+
+Register page follows the same pattern using gateRegister().
+
+================================================================================
+STEP 4: Protect Routes
+================================================================================
+
+### Protect API routes (server-side):
+
+```typescript
+// app/api/some-protected-route/route.ts
+import { withGateAuth } from "@/lib/gate";
+
+export async function GET(req: Request) {
+  const auth = await withGateAuth(req);
+  if (auth.error) return auth.error;
+
+  // auth.user is available: { id, email, name, role, apps }
+  // auth.scopes is available: ["read", "write"]
+  return Response.json({ message: `Hello ${auth.user.name}` });
+}
+```
+
+### Protect pages (client-side):
+
+```typescript
+// In any "use client" page component:
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { isAuthenticated, getUser } from "@/lib/gate";
+
+export default function ProtectedPage() {
+  const router = useRouter();
+
+  useEffect(() => {
+    if (!isAuthenticated()) {
+      router.push("/login");
+    }
+  }, [router]);
+
+  const user = getUser();
+  if (!user) return null;
+
+  return <div>Welcome, {user.name}</div>;
+}
+```
+
+### Make authenticated API calls from client:
+
+```typescript
+import { getValidToken } from "@/lib/gate";
+
+async function fetchProtectedData() {
+  const token = await getValidToken(); // auto-refreshes if expired
+  if (!token) {
+    window.location.href = "/login";
+    return;
+  }
+
+  const res = await fetch("/api/some-protected-route", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.json();
+}
+```
+
+### Logout:
+
+```typescript
+import { logout } from "@/lib/gate";
+
+function handleLogout() {
+  logout();
+  window.location.href = "/login";
+}
+```
+
+================================================================================
+API REFERENCE
+================================================================================
+
+Base URL: GATE_URL (env variable)
+
+### POST /api/v1/gate/register
+Request: { "email": string, "password": string (min 6), "name": string }
+Response 201: { "token": jwt, "refresh_token": jwt, "user": GateUser }
+Errors: 409 EMAIL_EXISTS, 422 VALIDATION_ERROR
+
+### POST /api/v1/gate/login
+Request: { "email": string, "password": string }
+Response 200: { "token": jwt, "refresh_token": jwt, "user": GateUser }
+Errors: 401 INVALID_CREDENTIALS, 422 VALIDATION_ERROR
+
+### POST /api/v1/gate/verify
+Request: { "token": jwt }
+Response 200: { "user": GateUser, "scopes": string[], "apps_allowed": string[] }
+Errors: 401 INVALID_TOKEN, 404 USER_NOT_FOUND
+
+### POST /api/v1/gate/refresh
+Request: { "refresh_token": jwt }
+Response 200: { "token": jwt, "refresh_token": jwt }
+Errors: 401 INVALID_REFRESH_TOKEN
+
+### GET /api/v1/gate/catalog
+Response 200: { "app", "version", "contract", "auth_methods", "features", "registered_apps", "scopes" }
+
+### GET /api/v1/gate/profile/:id
+Auth: Bearer token required
+Response 200: { "id", "email", "name", "role", "avatar_url", "apps": [{ "slug", "name", "icon", "url" }] }
+
+### PUT /api/v1/gate/profile/:id
+Auth: Bearer token required (own profile or admin)
+Request: { "name"?: string, "avatar_url"?: string | null }
+Response 200: { "id", "email", "name", "role", "avatar_url" }
+
+================================================================================
+GateUser TYPE
+================================================================================
+
+{
+  id: string;          // UUID
+  email: string;
+  name: string;
+  role: "user" | "admin";
+  avatar_url: string | null;
+  apps: string[];      // slugs of apps user can access
+  created_at: string;  // ISO-8601
+}
+
+================================================================================
+JWT PAYLOAD
+================================================================================
+
+{
+  "sub": "user-uuid",
+  "email": "user@example.com",
+  "name": "User Name",
+  "role": "user | admin",
+  "apps": ["academy", "forms", "profiler"],
+  "scopes": ["read", "write"],
+  "iat": 1234567890,
+  "exp": 1234571490
+}
+
+Access token TTL: 1 hour
+Refresh token TTL: 30 days
+
+================================================================================
+ERROR FORMAT
+================================================================================
+
+All errors follow: { "error": "Human message", "code": "MACHINE_CODE", "details"?: {} }
+
+| Code                  | HTTP | Meaning                    |
+|-----------------------|------|----------------------------|
+| VALIDATION_ERROR      | 422  | Invalid input              |
+| UNAUTHORIZED          | 401  | Missing auth header        |
+| INVALID_CREDENTIALS   | 401  | Wrong email/password       |
+| INVALID_TOKEN         | 401  | Expired or malformed JWT   |
+| INVALID_REFRESH_TOKEN | 401  | Bad refresh token          |
+| EMAIL_EXISTS          | 409  | Email already registered   |
+| USER_NOT_FOUND        | 404  | User not in database       |
+| APP_ACCESS_DENIED     | 403  | User lacks access to app   |
+| FORBIDDEN             | 403  | Insufficient permissions   |
+| GATE_UNAVAILABLE      | 503  | Gate service unreachable   |
+| INTERNAL_ERROR        | 500  | Server error               |
+
+================================================================================
+AUTH FLOW DIAGRAM
+================================================================================
+
+Login:
+  Client → POST gate/login (email, password)
+  Gate → validates → returns { token, refresh_token, user }
+  Client → saves to localStorage
+
+Accessing protected route:
+  Client → GET /api/protected (Authorization: Bearer <token>)
+  App server → POST gate/verify (token)
+  Gate → validates JWT → returns { user, scopes, apps_allowed }
+  App server → checks APP_SLUG in apps_allowed
+  App server → proceeds or returns 403
+
+Token refresh:
+  Client → detects token expiring (< 5 min left)
+  Client → POST gate/refresh (refresh_token)
+  Gate → returns new { token, refresh_token }
+  Client → updates localStorage
+
+================================================================================
+REGISTERED APP SLUGS
+================================================================================
+
+academy, forms, profiler, maps, hub, content-platform, work-timer, news-dashboard
+
+When integrating, use YOUR app's slug as APP_SLUG in lib/gate.ts.
+The slug must match what's registered in Gate's admin panel.
+
+================================================================================
+IMPORTANT RULES FOR AI AGENTS
+================================================================================
+
+1. NEVER store passwords — Gate handles all password hashing
+2. NEVER verify JWTs locally — always call POST /gate/verify
+3. ALWAYS use getValidToken() for client-side requests — it auto-refreshes
+4. ALWAYS check APP_SLUG access in withGateAuth — prevents unauthorized app access
+5. Set GATE_URL via environment variable — never hardcode the URL
+6. The lib/gate.ts file is self-contained — no additional packages needed
+7. If the app already has auth, REPLACE it — don't layer Gate on top
+8. Login/register UI stays in each app — only the backend calls change
+9. localStorage keys: gate_token, gate_refresh, gate_user — consistent across all apps
+10. On 401 from any API call, redirect user to /login and call logout()

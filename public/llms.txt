@@ -1,0 +1,25 @@
+# eximIA Gate — Universal Auth & Identity Contract v1
+
+> One identity. Every app.
+
+## How to integrate your app (4 steps)
+1. Add GATE_URL to .env.local
+2. Create lib/gate.ts (copy from /llms-full.txt — STEP 2)
+3. Replace login UI to call gateLogin() + saveAuth()
+4. Protect API routes with withGateAuth(req)
+
+## Full integration guide with copy-paste code
+GET /llms-full.txt — complete guide for AI agents
+
+## Key endpoints
+- POST /api/v1/gate/login — authenticate
+- POST /api/v1/gate/register — create account
+- POST /api/v1/gate/verify — validate token (server-side)
+- POST /api/v1/gate/refresh — renew token
+- GET /api/v1/gate/catalog — capabilities
+
+## Contract spec (JSON)
+GET /api/spec
+
+## Interactive docs
+GET /docs
