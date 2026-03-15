@@ -2,6 +2,11 @@
 # Contract: eximia-gate/v1
 # Purpose: This file contains EVERYTHING needed to integrate any Next.js app with eximIA Gate.
 # An AI agent reading this file should be able to implement the full integration autonomously.
+#
+# DUAL-MODE: Apps work WITH Gate (SSO) or WITHOUT Gate (standalone auth).
+# The mode is determined by the presence of GATE_URL environment variable.
+# If GATE_URL is set → Gate mode (SSO, unified identity)
+# If GATE_URL is not set → Standalone mode (app's own local auth)
 
 ================================================================================
 OVERVIEW
@@ -11,48 +16,70 @@ eximIA Gate is the centralized auth & identity service for the eximIA ecosystem.
 Each app keeps its own login UI but calls Gate's API behind the scenes.
 Users get one identity across all apps. Admins control which apps each user can access.
 
+DUAL-MODE ARCHITECTURE:
+- Gate mode (GATE_URL set): Login/register calls Gate API, tokens are Gate JWTs,
+  verification goes through Gate. SSO across all apps.
+- Standalone mode (GATE_URL not set): App uses its own local auth (existing auth,
+  Supabase, Prisma, whatever it already has). Zero dependency on Gate.
+
+This means you can integrate Gate without breaking anything — the app works
+standalone by default and gains SSO when GATE_URL is configured.
+
 GATE_URL: https://gate.eximiaventures.com.br (production)
 GATE_URL: http://localhost:3011 (development)
+GATE_URL: (not set) → standalone mode, Gate is not used
 
 ================================================================================
 INTEGRATION CHECKLIST (4 steps)
 ================================================================================
 
-1. Add GATE_URL to .env.local
-2. Create lib/gate.ts (auth utilities)
-3. Add login/register UI (or adapt existing)
-4. Protect API routes and pages with Gate auth
+1. Add GATE_URL to .env.local (optional — omit for standalone mode)
+2. Create lib/gate.ts (dual-mode auth utilities)
+3. Adapt login/register UI to use gate functions
+4. Protect API routes and pages with gate auth
 
 ================================================================================
 STEP 1: Environment Variable
 ================================================================================
 
-Add to your .env.local:
+Add to your .env.local (OPTIONAL — if omitted, app runs in standalone mode):
 
 ```
+# Set this to enable Gate SSO. Remove or leave empty for standalone auth.
 GATE_URL=http://localhost:3011
+NEXT_PUBLIC_GATE_URL=http://localhost:3011
 ```
 
 Add to your .env.local.example:
 
 ```
-GATE_URL=https://gate.eximiaventures.com.br
+# eximIA Gate SSO (optional — remove to use standalone auth)
+# GATE_URL=https://gate.eximiaventures.com.br
+# NEXT_PUBLIC_GATE_URL=https://gate.eximiaventures.com.br
 ```
 
 ================================================================================
-STEP 2: Create lib/gate.ts
+STEP 2: Create lib/gate.ts (DUAL-MODE)
 ================================================================================
 
 Create this file in your app. It handles ALL communication with Gate.
-Copy exactly as-is — no modifications needed except APP_SLUG.
+When GATE_URL is not set, all functions gracefully fall back to standalone behavior.
+Copy exactly as-is — only modify APP_SLUG and the standalone fallback functions.
 
 ```typescript
 // lib/gate.ts
-// eximIA Gate integration — generated from contract v1
-// Change APP_SLUG to your app's slug registered in Gate
+// eximIA Gate integration — dual-mode (Gate SSO + standalone fallback)
+// If GATE_URL is set → uses Gate for auth (SSO across ecosystem)
+// If GATE_URL is not set → falls back to standalone auth functions below
 
-const GATE_URL = process.env.GATE_URL || process.env.NEXT_PUBLIC_GATE_URL || "http://localhost:3011";
+const GATE_URL = process.env.GATE_URL || process.env.NEXT_PUBLIC_GATE_URL || "";
 const APP_SLUG = "YOUR_APP_SLUG"; // CHANGE THIS: academy, forms, profiler, maps, etc.
+
+// ─── Mode Detection ───
+
+export function isGateEnabled(): boolean {
+  return GATE_URL.length > 0;
+}
 
 // ─── Types ───
 
@@ -78,9 +105,13 @@ export interface VerifyResponse {
   apps_allowed: string[];
 }
 
-// ─── Client-side: Auth actions (call from UI) ───
+// ─── Client-side: Auth actions ───
 
 export async function gateLogin(email: string, password: string): Promise<AuthResponse> {
+  if (!isGateEnabled()) {
+    return standaloneLogin(email, password);
+  }
+
   const res = await fetch(`${GATE_URL}/api/v1/gate/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -92,6 +123,10 @@ export async function gateLogin(email: string, password: string): Promise<AuthRe
 }
 
 export async function gateRegister(name: string, email: string, password: string): Promise<AuthResponse> {
+  if (!isGateEnabled()) {
+    return standaloneRegister(name, email, password);
+  }
+
   const res = await fetch(`${GATE_URL}/api/v1/gate/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -103,6 +138,10 @@ export async function gateRegister(name: string, email: string, password: string
 }
 
 export async function gateRefresh(refresh_token: string): Promise<{ token: string; refresh_token: string }> {
+  if (!isGateEnabled()) {
+    return standaloneRefresh(refresh_token);
+  }
+
   const res = await fetch(`${GATE_URL}/api/v1/gate/refresh`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -148,16 +187,13 @@ export async function getValidToken(): Promise<string | null> {
   const token = getToken();
   if (!token) return null;
 
-  // Decode JWT to check expiry (no verification needed client-side)
   try {
     const payload = JSON.parse(atob(token.split(".")[1]));
     const expiresIn = payload.exp * 1000 - Date.now();
 
-    // If token expires in less than 5 minutes, refresh
     if (expiresIn < 5 * 60 * 1000) {
       const refresh = localStorage.getItem("gate_refresh");
       if (!refresh) return null;
-
       try {
         const data = await gateRefresh(refresh);
         localStorage.setItem("gate_token", data.token);
@@ -168,19 +204,24 @@ export async function getValidToken(): Promise<string | null> {
         return null;
       }
     }
-
     return token;
   } catch {
-    return token; // If decode fails, return as-is and let server validate
+    return token;
   }
 }
 
-// ─── Server-side: Protect API routes ───
+// ─── Server-side: Protect API routes (DUAL-MODE) ───
 
 export async function withGateAuth(req: Request): Promise<
-  { user: VerifyResponse["user"]; scopes: string[]; error?: never } |
+  { user: GateUser; scopes: string[]; error?: never } |
   { user?: never; scopes?: never; error: Response }
 > {
+  // STANDALONE MODE: use local auth verification
+  if (!isGateEnabled()) {
+    return standaloneVerify(req);
+  }
+
+  // GATE MODE: verify via Gate API
   const authHeader = req.headers.get("authorization");
   if (!authHeader?.startsWith("Bearer ")) {
     return {
@@ -212,7 +253,6 @@ export async function withGateAuth(req: Request): Promise<
 
     const data: VerifyResponse = await res.json();
 
-    // Check if user has access to THIS app
     if (!data.apps_allowed.includes(APP_SLUG)) {
       return {
         error: Response.json(
@@ -236,7 +276,7 @@ export async function withGateAuth(req: Request): Promise<
 // ─── Server-side: Require admin role ───
 
 export async function withGateAdmin(req: Request): Promise<
-  { user: VerifyResponse["user"]; error?: never } |
+  { user: GateUser; error?: never } |
   { user?: never; error: Response }
 > {
   const auth = await withGateAuth(req);
@@ -253,11 +293,100 @@ export async function withGateAdmin(req: Request): Promise<
 
   return { user: auth.user };
 }
+
+// =============================================================================
+// STANDALONE FALLBACK FUNCTIONS
+// =============================================================================
+// These functions are called when GATE_URL is NOT set.
+// REPLACE these with your app's actual local auth logic.
+// The signatures must stay the same — only the implementation changes.
+//
+// Option A: If your app uses Supabase Auth, call supabase.auth.signIn() here.
+// Option B: If your app uses its own JWT, implement local JWT logic here.
+// Option C: If your app has no auth yet, implement basic auth here.
+//
+// The key insight: gateLogin/gateRegister/withGateAuth call these functions
+// when Gate is not available, so your app works either way.
+// =============================================================================
+
+async function standaloneLogin(email: string, password: string): Promise<AuthResponse> {
+  // REPLACE with your app's local login logic. Example for a local API:
+  const res = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Login failed");
+  return data;
+}
+
+async function standaloneRegister(name: string, email: string, password: string): Promise<AuthResponse> {
+  // REPLACE with your app's local register logic. Example:
+  const res = await fetch("/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, email, password }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Registration failed");
+  return data;
+}
+
+async function standaloneRefresh(refresh_token: string): Promise<{ token: string; refresh_token: string }> {
+  // REPLACE with your app's local refresh logic. Example:
+  const res = await fetch("/api/auth/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Refresh failed");
+  return data;
+}
+
+async function standaloneVerify(req: Request): Promise<
+  { user: GateUser; scopes: string[]; error?: never } |
+  { user?: never; scopes?: never; error: Response }
+> {
+  // REPLACE with your app's local token verification.
+  // This must extract the token from the Authorization header,
+  // verify it locally, and return the user.
+  //
+  // Example using a local /api/auth/verify endpoint:
+  const authHeader = req.headers.get("authorization");
+  if (!authHeader?.startsWith("Bearer ")) {
+    return {
+      error: Response.json({ error: "Unauthorized", code: "UNAUTHORIZED" }, { status: 401 }),
+    };
+  }
+
+  try {
+    const res = await fetch(`${req.url.split("/api/")[0]}/api/auth/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: authHeader.slice(7) }),
+    });
+    if (!res.ok) {
+      return { error: Response.json({ error: "Invalid token", code: "INVALID_TOKEN" }, { status: 401 }) };
+    }
+    const data = await res.json();
+    return { user: data.user, scopes: data.scopes || ["read", "write"] };
+  } catch {
+    return { error: Response.json({ error: "Auth error", code: "AUTH_ERROR" }, { status: 500 }) };
+  }
+}
 ```
 
 ================================================================================
 STEP 3: Login & Register UI
 ================================================================================
+
+The login/register code is IDENTICAL regardless of mode. The `gateLogin()` and
+`gateRegister()` functions handle the routing internally:
+
+- If GATE_URL is set → calls Gate API
+- If GATE_URL is not set → calls standalone fallback functions
 
 Option A: Minimal login page (replace your existing /login page)
 
@@ -308,14 +437,14 @@ Option B: If your app already has a login form, just replace the submit handler:
 // Before (local auth):
 const res = await fetch("/api/auth/login", { ... });
 
-// After (Gate auth):
+// After (dual-mode — works with or without Gate):
 import { gateLogin, saveAuth } from "@/lib/gate";
 const data = await gateLogin(email, password);
 saveAuth(data);
 router.push("/dashboard");
 ```
 
-Register page follows the same pattern using gateRegister().
+The exact same code works in both modes. No if/else needed in UI.
 
 ================================================================================
 STEP 4: Protect Routes
@@ -332,7 +461,7 @@ export async function GET(req: Request) {
   if (auth.error) return auth.error;
 
   // auth.user is available: { id, email, name, role, apps }
-  // auth.scopes is available: ["read", "write"]
+  // Works in both Gate mode AND standalone mode
   return Response.json({ message: `Hello ${auth.user.name}` });
 }
 ```
@@ -380,19 +509,39 @@ async function fetchProtectedData() {
 }
 ```
 
-### Logout:
+### Check which mode is active (optional, for UI indicators):
 
 ```typescript
-import { logout } from "@/lib/gate";
+import { isGateEnabled } from "@/lib/gate";
 
-function handleLogout() {
-  logout();
-  window.location.href = "/login";
+// Show "SSO enabled" badge or similar
+if (isGateEnabled()) {
+  console.log("Running with eximIA Gate SSO");
+} else {
+  console.log("Running in standalone mode");
 }
 ```
 
 ================================================================================
-API REFERENCE
+DUAL-MODE SUMMARY
+================================================================================
+
+| Aspect              | Gate Mode (GATE_URL set)          | Standalone (GATE_URL empty)        |
+|---------------------|-----------------------------------|------------------------------------|
+| Login               | Calls Gate /login API             | Calls local /api/auth/login        |
+| Register            | Calls Gate /register API          | Calls local /api/auth/register     |
+| Token verification  | Calls Gate /verify API            | Calls local /api/auth/verify       |
+| Token refresh       | Calls Gate /refresh API           | Calls local /api/auth/refresh      |
+| SSO                 | Yes — one identity across apps    | No — app-specific auth             |
+| App access control  | Yes — admin controls per-user     | No — anyone can access             |
+| Unified profile     | Yes — cross-app profile           | No — app-local profile             |
+| UI code             | Same                              | Same                               |
+| localStorage keys   | gate_token, gate_refresh, gate_user | gate_token, gate_refresh, gate_user |
+
+Switching modes = adding or removing GATE_URL from .env.local. Zero code changes.
+
+================================================================================
+API REFERENCE (Gate endpoints — only used in Gate mode)
 ================================================================================
 
 Base URL: GATE_URL (env variable)
@@ -439,27 +588,9 @@ GateUser TYPE
   name: string;
   role: "user" | "admin";
   avatar_url: string | null;
-  apps: string[];      // slugs of apps user can access
+  apps: string[];      // slugs of apps user can access (empty in standalone)
   created_at: string;  // ISO-8601
 }
-
-================================================================================
-JWT PAYLOAD
-================================================================================
-
-{
-  "sub": "user-uuid",
-  "email": "user@example.com",
-  "name": "User Name",
-  "role": "user | admin",
-  "apps": ["academy", "forms", "profiler"],
-  "scopes": ["read", "write"],
-  "iat": 1234567890,
-  "exp": 1234571490
-}
-
-Access token TTL: 1 hour
-Refresh token TTL: 30 days
 
 ================================================================================
 ERROR FORMAT
@@ -485,23 +616,44 @@ All errors follow: { "error": "Human message", "code": "MACHINE_CODE", "details"
 AUTH FLOW DIAGRAM
 ================================================================================
 
-Login:
-  Client → POST gate/login (email, password)
+GATE MODE:
+  Client → gateLogin(email, pass)
+  lib/gate.ts → POST gate.eximiaventures.com.br/api/v1/gate/login
   Gate → validates → returns { token, refresh_token, user }
-  Client → saves to localStorage
+  lib/gate.ts → saveAuth() → localStorage
 
-Accessing protected route:
-  Client → GET /api/protected (Authorization: Bearer <token>)
-  App server → POST gate/verify (token)
-  Gate → validates JWT → returns { user, scopes, apps_allowed }
-  App server → checks APP_SLUG in apps_allowed
-  App server → proceeds or returns 403
+STANDALONE MODE:
+  Client → gateLogin(email, pass)
+  lib/gate.ts → standaloneLogin() → POST /api/auth/login (your local endpoint)
+  Your API → validates → returns { token, refresh_token, user }
+  lib/gate.ts → saveAuth() → localStorage
 
-Token refresh:
-  Client → detects token expiring (< 5 min left)
-  Client → POST gate/refresh (refresh_token)
-  Gate → returns new { token, refresh_token }
-  Client → updates localStorage
+The UI code is identical. Only the destination of the fetch changes.
+
+================================================================================
+STANDALONE FALLBACK: WHAT TO REPLACE
+================================================================================
+
+In lib/gate.ts, there are 4 standalone functions at the bottom:
+
+1. standaloneLogin() — Replace with your app's local login API call
+2. standaloneRegister() — Replace with your app's local register API call
+3. standaloneRefresh() — Replace with your app's local refresh API call
+4. standaloneVerify() — Replace with your app's local token verification
+
+If your app uses Supabase Auth:
+  - standaloneLogin → supabase.auth.signInWithPassword()
+  - standaloneRegister → supabase.auth.signUp()
+  - standaloneVerify → supabase.auth.getUser(token)
+
+If your app uses its own JWT (like Profiler):
+  - standaloneLogin → call your existing /api/auth/login
+  - standaloneVerify → verify JWT with your local secret
+
+If your app has NO auth yet:
+  - Leave the defaults (they call /api/auth/login etc.)
+  - Create those local endpoints in your app
+  - OR just set GATE_URL and use Gate directly
 
 ================================================================================
 REGISTERED APP SLUGS
@@ -516,13 +668,16 @@ The slug must match what's registered in Gate's admin panel.
 IMPORTANT RULES FOR AI AGENTS
 ================================================================================
 
-1. NEVER store passwords — Gate handles all password hashing
-2. NEVER verify JWTs locally — always call POST /gate/verify
+1. NEVER store passwords — Gate (or standalone auth) handles all password hashing
+2. NEVER verify JWTs locally in Gate mode — always call POST /gate/verify
 3. ALWAYS use getValidToken() for client-side requests — it auto-refreshes
 4. ALWAYS check APP_SLUG access in withGateAuth — prevents unauthorized app access
 5. Set GATE_URL via environment variable — never hardcode the URL
 6. The lib/gate.ts file is self-contained — no additional packages needed
-7. If the app already has auth, REPLACE it — don't layer Gate on top
+7. If the app already has auth, wire the standalone fallbacks to it
 8. Login/register UI stays in each app — only the backend calls change
 9. localStorage keys: gate_token, gate_refresh, gate_user — consistent across all apps
 10. On 401 from any API call, redirect user to /login and call logout()
+11. DUAL-MODE is automatic — same code works with or without Gate
+12. To enable Gate: add GATE_URL to .env.local. To disable: remove it. Zero code changes.
+13. ALWAYS implement the standalone fallback functions for the specific app's existing auth
